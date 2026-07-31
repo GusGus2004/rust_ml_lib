@@ -1,6 +1,6 @@
 # rust_ml_lib
 
-A neural network library and autodiff engine, built from scratch in Rust.
+A NN library and autodiff engine, built from scratch in Rust.
 
 This started as a translation exercise: taking a small machine learning
 library originally written in C — matrices, a reverse-mode automatic
@@ -17,19 +17,17 @@ handwritten digits from the MNIST dataset, entirely with code in this repo.
 
 - **A row-major `Matrix` type** with creation, disk loading, elementwise
   ops, matrix multiplication (with all four transpose combinations),
-  ReLU, softmax, and cross-entropy — plus the gradient ("backward")
+  ReLU, softmax, and cross-entropy — and the gradient
   version of every one of those operations.
 - **A reverse-mode automatic differentiation engine** — a computation
   graph (`ModelContext`) where each node knows its operation and its
-  inputs, can be compiled into a topologically-sorted execution order,
+  inputs, can be compiled into a topologically-sorted order,
   run forward to produce values, and run backward to produce gradients
   automatically via the chain rule. This is the same core idea behind
-  PyTorch/TensorFlow's autograd, at a much smaller scale.
+  PyTorch/TensorFlow's autograd, at a much much smaller scale.
 - **A small, seedable PRNG** (xorshift32) for reproducible weight
   initialization and batch shuffling.
-- **A training loop** with mini-batch gradient descent, using the
-  **Adam optimizer** (adaptive per-parameter learning rates, with bias
-  correction) rather than plain SGD.
+- **A training loop** with mini-batch gradient descent - so far plain SGD
 - **A working demo**: a 784 → 16 → 16 → 10 MLP with a residual
   connection, trained on MNIST, reaching roughly 94–95% test accuracy
   after 10 epochs.
@@ -85,7 +83,7 @@ strongly favor the correct digit.
 ## Design notes
 
 A few deliberate departures from a literal, line-for-line C translation,
-made in the interest of idiomatic and *provably* correct Rust:
+made in the interest of idiomatic and provably correct Rust:
 
 - **Ownership instead of a manual arena.** The C original threads a
   `mem_arena` through every allocation. Here, `Vec`/`Matrix` just own
