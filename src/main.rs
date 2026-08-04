@@ -5,7 +5,7 @@ mod rng;
 use matrix::Matrix;
 use model::{ModelContext, ModelTrainingDesc, ModelVarFlags};
 
-/// Renders a 28x28 grayscale digit using ANSI 256-color background codes.
+
 fn draw_mnist_digit(data: &[f32]) {
     for y in 0..28usize {
         for x in 0..28usize {
@@ -18,9 +18,7 @@ fn draw_mnist_digit(data: &[f32]) {
     print!("\x1b[0m");
 }
 
-/// Builds a small MLP: 784 -> 16 -> 16 -> 10, with a residual-style skip
-/// connection at the second hidden layer, softmax output, and
-/// cross-entropy loss.
+
 fn create_mnist_model(model: &mut ModelContext) -> Result<(), matrix::MatrixError> {
     let input = model.mv_create(784, 1, ModelVarFlags::INPUT)?;
 
@@ -32,8 +30,7 @@ fn create_mnist_model(model: &mut ModelContext) -> Result<(), matrix::MatrixErro
     let bound1 = (6.0f32 / (16.0 + 16.0)).sqrt();
     let bound2 = (6.0f32 / (16.0 + 10.0)).sqrt();
 
-    // model.vars[..] and model.prng are disjoint fields, so borrowing both
-    // at once here is fine — no need to split them apart manually.
+
     model.vars[w0].val.as_ref().unwrap().borrow_mut().fill_rand(&mut model.prng, -bound0, bound0);
     model.vars[w1].val.as_ref().unwrap().borrow_mut().fill_rand(&mut model.prng, -bound1, bound1);
     model.vars[w2].val.as_ref().unwrap().borrow_mut().fill_rand(&mut model.prng, -bound2, bound2);
@@ -57,10 +54,6 @@ fn create_mnist_model(model: &mut ModelContext) -> Result<(), matrix::MatrixErro
 
     let y = model.mv_create(10, 1, ModelVarFlags::DESIRED_OUTPUT)?;
 
-    // Underscore prefix: we don't need the index itself here, only the
-    // side effect of registering the cost node (mirrors the C original,
-    // which also never reads `cost` again directly — model_compile finds
-    // it later by scanning for the COST flag).
     let _cost = model.mv_cross_entropy(y, output, ModelVarFlags::COST)?;
 
     Ok(())
@@ -93,9 +86,6 @@ fn main() -> Result<(), matrix::MatrixError> {
     }
     print!("\n\n");
 
-    // NOTE: seed is a Rust-only addition (see ModelContext::new in model.rs)
-    // since the C version drew from an implicit global RNG with no visible
-    // seed anywhere in main().
     let mut model = ModelContext::new(42);
     create_mnist_model(&mut model)?;
     model.compile();
@@ -119,12 +109,8 @@ fn main() -> Result<(), matrix::MatrixError> {
         test_images: &test_images,
         test_labels: &test_labels,
 
-        epochs: 30,
-        batch_size: 500,
-        // 0.01 was tuned for plain SGD. Adam's adaptive per-parameter
-        // scaling means that same rate is too aggressive here — it caused
-        // weights to spike and eventually overflow to NaN partway through
-        // training. 0.001 is Adam's standard recommended default.
+        epochs: 10,
+        batch_size: 50,
         learning_rate: 0.001,
     };
     model.train(&training_desc);
@@ -138,8 +124,6 @@ fn main() -> Result<(), matrix::MatrixError> {
 
     print!("post-training output: ");
     for i in 0..10 {
-        // C's bare %f defaults to 6 decimal places; Rust's {} doesn't pad
-        // at all, so {:.6} is the faithful match here.
         print!("{:.6} ", model.vars[output_idx].val.as_ref().unwrap().borrow().data[i]);
     }
     print!("\n\n");

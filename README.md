@@ -111,7 +111,7 @@ Roughly in order of "natural next step" to "bigger undertaking":
       analytic gradients against a finite-difference approximation, to
       catch subtle backprop diffs directly rather than inferring
       correctness from accuracy numbers alone
-- [ ] **Model checkpointing** — save/load trained weights to disk, so a
+- [x] **Model checkpointing** — save/load trained weights to disk, so a
       trained model doesn't have to be retrained from scratch every run
 - [ ] **True batched matrix operations** — right now a "batch" is a Rust
       loop over individual examples; reshaping so a whole batch is one
