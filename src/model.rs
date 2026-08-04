@@ -1,11 +1,10 @@
-// Auto-Differentiation 
-
 use std::cell::RefCell;
 
 use crate::matrix::{Matrix, MatrixError};
 use crate::rng::Prng;
 
-
+/// Bitflags tagging what role a graph node plays.
+/// Combine with `|`, e.g. `ModelVarFlags::PARAMETER | ModelVarFlags::REQUIRES_GRAD`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelVarFlags(pub u32);
 
@@ -88,11 +87,17 @@ pub const MODEL_VAR_MAX_INPUTS: usize = 2;
 /// borrowing two elements at once (one mutably). `RefCell` moves that
 /// check to runtime, which is what makes this graph-walking code provably
 /// correct without `unsafe`.
+///
+/// `m`/`v` hold Adam optimizer state (first/second moment estimates) —
+/// not present in the original C design (which only had plain SGD), only
+/// ever allocated for nodes flagged PARAMETER.
 #[derive(Debug, Clone)]
 pub struct ModelVar {
     pub flags: ModelVarFlags,
     pub val: Option<RefCell<Matrix>>,
     pub grad: Option<RefCell<Matrix>>,
+    pub m: Option<RefCell<Matrix>>,
+    pub v: Option<RefCell<Matrix>>,
     pub op: ModelVarOp,
     pub inputs: [Option<usize>; MODEL_VAR_MAX_INPUTS],
 }
@@ -398,11 +403,24 @@ impl ModelContext {
         } else {
             None
         };
+        // Adam state only makes sense for things the optimizer actually
+        // updates — i.e. parameters. Zero-initialized, matching Adam's
+        // usual starting point for its moment estimates.
+        let (m, v) = if flags.contains(ModelVarFlags::PARAMETER) {
+            (
+                Some(RefCell::new(Matrix::create(rows, cols)?)),
+                Some(RefCell::new(Matrix::create(rows, cols)?)),
+            )
+        } else {
+            (None, None)
+        };
 
         self.vars.push(ModelVar {
             flags,
             val,
             grad,
+            m,
+            v,
             op: ModelVarOp::Create,
             inputs: [None, None],
         });
@@ -624,8 +642,64 @@ impl ModelContext {
         self.forward_prog.compute(self);
     }
 
-    /// Equivalent to `model_train`.
+    /// Not a translation of any C function — model checkpointing. Saves
+    /// every PARAMETER-flagged node's value into its own file inside
+    /// `dir`, in the order those nodes appear in `self.vars`. Creates
+    /// `dir` if it doesn't already exist.
+    ///
+    /// Relies on graph construction being deterministic: as long as the
+    /// same model-building function (e.g. `create_mnist_model`) is called
+    /// to build the graph, PARAMETER nodes always get created in the same
+    /// order, so `param_0`, `param_1`, ... always line up with the same
+    /// weight/bias matrices on both save and load.
+    pub fn save_parameters(&self, dir: &str) -> Result<(), MatrixError> {
+        std::fs::create_dir_all(dir)?;
+
+        let mut i = 0;
+        for var in &self.vars {
+            if !var.flags.contains(ModelVarFlags::PARAMETER) {
+                continue;
+            }
+            let path = format!("{}/param_{}.mat", dir, i);
+            var.val.as_ref().unwrap().borrow().save(&path)?;
+            i += 1;
+        }
+
+        Ok(())
+    }
+
+    /// The load-side counterpart to `save_parameters`. IMPORTANT: this
+    /// only overwrites the contents of PARAMETER matrices that already
+    /// exist in the graph — it doesn't build the graph itself. Call your
+    /// model-building function first (so every node exists with the
+    /// correct shape), then call this to load trained values into it.
+    pub fn load_parameters(&mut self, dir: &str) -> Result<(), MatrixError> {
+        let mut i = 0;
+        for var in &self.vars {
+            if !var.flags.contains(ModelVarFlags::PARAMETER) {
+                continue;
+            }
+
+            let mut val = var.val.as_ref().unwrap().borrow_mut();
+            let path = format!("{}/param_{}.mat", dir, i);
+            let loaded = Matrix::load(val.rows, val.cols, &path)?;
+            val.copy_from(&loaded)?;
+
+            i += 1;
+        }
+
+        Ok(())
+    }
+
+    /// Equivalent to `model_train`, but using Adam instead of plain SGD for
+    /// the parameter update step. beta1/beta2/epsilon use the standard
+    /// values from the Adam paper — not exposed as config since they
+    /// rarely need tuning in practice.
     pub fn train(&mut self, desc: &ModelTrainingDesc) {
+        const BETA1: f32 = 0.9;
+        const BETA2: f32 = 0.999;
+        const EPSILON: f32 = 1e-8;
+
         let train_images = desc.train_images;
         let train_labels = desc.train_labels;
         let test_images = desc.test_images;
@@ -689,25 +763,43 @@ impl ModelContext {
                 }
                 avg_cost /= desc.batch_size as f32;
 
+                // Global step count across the whole run (not reset per
+                // epoch) — Adam's bias correction needs this to know how
+                // "early" in training this update is.
+                let step = (epoch as usize * num_batches + batch + 1) as i32;
+
                 for &idx in &self.cost_prog.vars {
                     if !self.vars[idx].flags.contains(ModelVarFlags::PARAMETER) {
                         continue;
                     }
 
+                    // Average the accumulated gradient over the batch
+                    // before feeding it to Adam (same averaging SGD did).
                     self.vars[idx]
                         .grad
                         .as_ref()
                         .unwrap()
                         .borrow_mut()
-                        .scale(desc.learning_rate / desc.batch_size as f32);
+                        .scale(1.0 / desc.batch_size as f32);
 
                     let grad_snapshot = self.vars[idx].grad.as_ref().unwrap().borrow();
+                    let mut m = self.vars[idx].m.as_ref().unwrap().borrow_mut();
+                    let mut v = self.vars[idx].v.as_ref().unwrap().borrow_mut();
                     self.vars[idx]
                         .val
                         .as_ref()
                         .unwrap()
                         .borrow_mut()
-                        .sub_assign(&grad_snapshot);
+                        .adam_step(
+                            &mut m,
+                            &mut v,
+                            &grad_snapshot,
+                            desc.learning_rate,
+                            BETA1,
+                            BETA2,
+                            EPSILON,
+                            step,
+                        );
                 }
 
                 print!(
@@ -782,4 +874,104 @@ pub struct ModelTrainingDesc<'a> {
     pub epochs: u32,
     pub batch_size: u32,
     pub learning_rate: f32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Combined relative/absolute tolerance — appropriate for f32, which
+    /// is noisier than the f64 most textbook gradient-check examples
+    /// assume. A real bug (wrong sign, swapped transpose, wrong formula)
+    /// produces errors far bigger than this; this tolerance is only
+    /// generous enough to absorb float round-off, not to hide mistakes.
+    fn approx_eq(a: f32, b: f32, tol: f32) -> bool {
+        (a - b).abs() <= tol * a.abs().max(b.abs()).max(1.0)
+    }
+
+    /// Builds a small graph that deliberately routes through every op
+    /// type — MatMul, Add, Sub, Relu, Softmax, CrossEntropy — including
+    /// Sub, which no model built anywhere else in this codebase actually
+    /// exercises. Values are fixed (not random) so the test is
+    /// deterministic and any failure is easy to reproduce and reason
+    /// about.
+    #[test]
+    fn backward_pass_matches_numerical_gradient() {
+        let mut model = ModelContext::new(1);
+
+        let x = model.mv_create(2, 1, ModelVarFlags::INPUT).unwrap();
+        let w = model
+            .mv_create(2, 2, ModelVarFlags::REQUIRES_GRAD | ModelVarFlags::PARAMETER)
+            .unwrap();
+        let b = model
+            .mv_create(2, 1, ModelVarFlags::REQUIRES_GRAD | ModelVarFlags::PARAMETER)
+            .unwrap();
+        let c = model
+            .mv_create(2, 1, ModelVarFlags::REQUIRES_GRAD | ModelVarFlags::PARAMETER)
+            .unwrap();
+        let y = model.mv_create(2, 1, ModelVarFlags::DESIRED_OUTPUT).unwrap();
+
+        model.vars[x].val.as_ref().unwrap().borrow_mut().data = vec![0.5, -0.3];
+        model.vars[w].val.as_ref().unwrap().borrow_mut().data = vec![0.2, -0.4, 0.1, 0.3];
+        model.vars[b].val.as_ref().unwrap().borrow_mut().data = vec![0.1, -0.2];
+        model.vars[c].val.as_ref().unwrap().borrow_mut().data = vec![0.05, 0.15];
+        model.vars[y].val.as_ref().unwrap().borrow_mut().data = vec![1.0, 0.0];
+
+        // relu(w @ x + b) - c, softmax, then cross-entropy against y.
+        // input/output/desired_output/cost all get registered on the
+        // ModelContext automatically via the flags passed here (see
+        // mv_create) — no manual wiring needed.
+        let wx = model.mv_matmul(w, x, ModelVarFlags::NONE).unwrap();
+        let wxb = model.mv_add(wx, b, ModelVarFlags::NONE).unwrap();
+        let relu_out = model.mv_relu(wxb, ModelVarFlags::NONE).unwrap();
+        let diff = model.mv_sub(relu_out, c, ModelVarFlags::NONE).unwrap();
+        let softmax_out = model.mv_softmax(diff, ModelVarFlags::OUTPUT).unwrap();
+        let cost = model
+            .mv_cross_entropy(y, softmax_out, ModelVarFlags::COST)
+            .unwrap();
+
+        model.compile();
+
+        // The analytic pass: run forward + backward exactly once, with
+        // everything at its original value. Every parameter's gradient
+        // is now sitting in its .grad buffer.
+        model.cost_prog.compute(&model);
+        model.cost_prog.compute_grads(&model);
+
+        let epsilon = 1e-3;
+
+        for &param in &[w, b, c] {
+            let len = model.vars[param].val.as_ref().unwrap().borrow().data.len();
+
+            for i in 0..len {
+                let analytic = model.vars[param].grad.as_ref().unwrap().borrow().data[i];
+                let original = model.vars[param].val.as_ref().unwrap().borrow().data[i];
+
+                // Nudge this one entry up, re-run the forward pass only
+                // (no backward — the numeric check never touches
+                // compute_grads, which is the whole point), read the cost.
+                model.vars[param].val.as_ref().unwrap().borrow_mut().data[i] = original + epsilon;
+                model.cost_prog.compute(&model);
+                let cost_plus = model.vars[cost].val.as_ref().unwrap().borrow().sum();
+
+                model.vars[param].val.as_ref().unwrap().borrow_mut().data[i] = original - epsilon;
+                model.cost_prog.compute(&model);
+                let cost_minus = model.vars[cost].val.as_ref().unwrap().borrow().sum();
+
+                // Restore before moving to the next entry.
+                model.vars[param].val.as_ref().unwrap().borrow_mut().data[i] = original;
+
+                let numeric = (cost_plus - cost_minus) / (2.0 * epsilon);
+
+                assert!(
+                    approx_eq(analytic, numeric, 1e-2),
+                    "gradient mismatch for param {} entry {}: analytic={}, numeric={}",
+                    param,
+                    i,
+                    analytic,
+                    numeric
+                );
+            }
+        }
+    }
 }

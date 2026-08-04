@@ -4,7 +4,7 @@ A NN library and autodiff engine, built from scratch in Rust.
 
 This started as a translation exercise: taking a small machine learning
 library originally written in C — matrices, a reverse-mode automatic
-differentiation engine, and a training loop — and reimplementing it in
+differentiation engine, and a training loop - and reimplementing it in
 idiomatic Rust. No external ML crates, just the standard library.
 
 Thank you very much to Magicalbat for his inspiration on the original C ML library along with his Youtube too:
@@ -106,10 +106,10 @@ Roughly in order of "natural next step" to "bigger undertaking":
 
 - [x] Translate the core matrix library and its gradients
 - [x] Translate the autodiff engine and MNIST training loop
-- [ ] **Replace plain SGD with the Adam optimizer**
-- [ ] **Numerical gradient checking** — a test that compares the
+- [x] Replace plain SGD with the Adam optimizer
+- [x] **Numerical gradient checking** — a test that compares the
       analytic gradients against a finite-difference approximation, to
-      catch subtle backprop bugs directly rather than inferring
+      catch subtle backprop diffs directly rather than inferring
       correctness from accuracy numbers alone
 - [ ] **Model checkpointing** — save/load trained weights to disk, so a
       trained model doesn't have to be retrained from scratch every run

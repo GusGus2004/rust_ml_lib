@@ -1,10 +1,7 @@
-// Linear Algerba - General Purpose 2D Matrix Library 
-
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::rng::Prng;
-
 
 #[derive(Debug, Clone)]
 pub struct Matrix {
@@ -18,7 +15,9 @@ pub enum MatrixError {
     ZeroDimension,
     SizeOverflow,
     ShapeMismatch,
-    
+    // Inner io::Error is never read back out (only ever printed via
+    // Debug), which is fine — it's there for diagnostic context, not to
+    // be matched on.
     #[allow(dead_code)]
     Io(std::io::Error),
 }
@@ -26,6 +25,58 @@ pub enum MatrixError {
 impl From<std::io::Error> for MatrixError {
     fn from(e: std::io::Error) -> Self {
         MatrixError::Io(e)
+    }
+}
+
+/// Internal helper: out += a * b, assuming out, a, b already have compatible
+/// shapes and out is pre-zeroed by the caller. Not part of the public API.
+fn mat_mul_nn(out: &mut Matrix, a: &Matrix, b: &Matrix) {
+    for i in 0..out.rows as usize {
+        for k in 0..a.cols as usize {
+            for j in 0..out.cols as usize {
+                out.data[j + i * out.cols as usize] +=
+                    a.data[k + i * a.cols as usize] * b.data[j + k * b.cols as usize];
+            }
+        }
+    }
+}
+
+/// Internal helper: out += a * b^T, assuming out, a, b already have compatible
+/// shapes and out is pre-zeroed by the caller. Not part of the public API.
+fn mat_mul_nt(out: &mut Matrix, a: &Matrix, b: &Matrix) {
+    for i in 0..out.rows as usize {
+        for j in 0..out.cols as usize {
+            for k in 0..a.cols as usize {
+                out.data[j + i * out.cols as usize] +=
+                    a.data[k + i * a.cols as usize] * b.data[k + j * b.cols as usize];
+            }
+        }
+    }
+}
+
+/// Internal helper: out += a^T * b, assuming out, a, b already have compatible
+/// shapes and out is pre-zeroed by the caller. Not part of the public API.
+fn mat_mul_tn(out: &mut Matrix, a: &Matrix, b: &Matrix) {
+    for k in 0..a.rows as usize {
+        for i in 0..out.rows as usize {
+            for j in 0..out.cols as usize {
+                out.data[j + i * out.cols as usize] +=
+                    a.data[i + k * a.cols as usize] * b.data[j + k * b.cols as usize];
+            }
+        }
+    }
+}
+
+/// Internal helper: out += a^T * b^T, assuming out, a, b already have compatible
+/// shapes and out is pre-zeroed by the caller. Not part of the public API.
+fn mat_mul_tt(out: &mut Matrix, a: &Matrix, b: &Matrix) {
+    for i in 0..out.rows as usize {
+        for j in 0..out.cols as usize {
+            for k in 0..a.rows as usize {
+                out.data[j + i * out.cols as usize] +=
+                    a.data[i + k * a.cols as usize] * b.data[k + j * b.cols as usize];
+            }
+        }
     }
 }
 
@@ -53,11 +104,12 @@ impl Matrix {
         let file_len = f.seek(SeekFrom::End(0))?;
         f.seek(SeekFrom::Start(0))?;
 
-        
+        // Bytes available in mat.data, as in the C version (sizeof(f32) * rows * cols)
         let max_bytes = mat.data.len() * std::mem::size_of::<f32>();
         let read_len = file_len.min(max_bytes as u64) as usize;
 
-        
+        // Reinterpret mat.data (Vec<f32>) as a byte buffer for reading raw bytes,
+        // mirroring fread(mat->data, 1, size, f)
         let byte_buf = unsafe {
             std::slice::from_raw_parts_mut(mat.data.as_mut_ptr() as *mut u8, max_bytes)
         };
@@ -67,8 +119,30 @@ impl Matrix {
         Ok(mat)
     }
 
-    
-    #[allow(dead_code)]
+    /// Not a translation of any C function — the write counterpart to
+    /// `load`, added for model checkpointing. Writes the same flat,
+    /// headerless raw-f32 format `load` reads, so a saved parameter file
+    /// is byte-compatible with the same tooling used for the MNIST data.
+    pub fn save(&self, filename: &str) -> Result<(), MatrixError> {
+        let mut f = File::create(filename)?;
+
+        // Reinterpret the f32 buffer as raw bytes for writing — the
+        // write-side mirror of the same reinterpretation `load` does when
+        // reading bytes in.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                self.data.as_ptr() as *const u8,
+                self.data.len() * std::mem::size_of::<f32>(),
+            )
+        };
+
+        f.write_all(bytes)?;
+        Ok(())
+    }
+
+    /// Equivalent to `mat_copy`. Now has a real caller:
+    /// `ModelContext::load_parameters` uses this to copy freshly-loaded
+    /// weight data into an already-shaped parameter matrix.
     pub fn copy_from(&mut self, src: &Matrix) -> Result<(), MatrixError> {
         if self.rows != src.rows || self.cols != src.cols {
             return Err(MatrixError::ShapeMismatch);
@@ -102,17 +176,60 @@ impl Matrix {
         self.data.iter().sum()
     }
 
-    
+    /// Elementwise self += other. Not a direct translation of any single C
+    /// function — added because Rust's borrow checker won't allow calling
+    /// `self.add(self, other)` the way C's `mat_add(a->grad, a->grad,
+    /// cur->grad)` safely could (pointer self-aliasing is fine there since
+    /// it's a simple per-index read-then-write). Assumes shapes already
+    /// match (guaranteed by how this is used elsewhere in this codebase).
     pub fn add_assign(&mut self, other: &Matrix) {
         for i in 0..self.data.len() {
             self.data[i] += other.data[i];
         }
     }
 
-    
+    /// Elementwise self -= other. Same rationale as `add_assign` above,
+    /// covering C's `mat_sub(cur->val, cur->val, cur->grad)` and
+    /// `mat_sub(b->grad, b->grad, cur->grad)` self-aliasing patterns.
     pub fn sub_assign(&mut self, other: &Matrix) {
         for i in 0..self.data.len() {
             self.data[i] -= other.data[i];
+        }
+    }
+
+    /// Applies one Adam optimizer step to `self` (a parameter's value),
+    /// given its running first-moment estimate `m`, second-moment
+    /// estimate `v`, the current gradient, and the step number `t`
+    /// (starting at 1, incrementing once per optimizer step across the
+    /// whole training run — not per epoch). Not a translation of any C
+    /// function; this is the new optimizer replacing plain SGD.
+    #[allow(clippy::too_many_arguments)]
+    pub fn adam_step(
+        &mut self,
+        m: &mut Matrix,
+        v: &mut Matrix,
+        grad: &Matrix,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        epsilon: f32,
+        t: i32,
+    ) {
+        let bias_correction1 = 1.0 - beta1.powi(t);
+        let bias_correction2 = 1.0 - beta2.powi(t);
+
+        for i in 0..self.data.len() {
+            // Exponential moving averages of the gradient and its square.
+            m.data[i] = beta1 * m.data[i] + (1.0 - beta1) * grad.data[i];
+            v.data[i] = beta2 * v.data[i] + (1.0 - beta2) * grad.data[i] * grad.data[i];
+
+            // Bias correction: without this, m and v start too close to
+            // zero (since they're initialized at zero), which would make
+            // the very first few steps too small.
+            let m_hat = m.data[i] / bias_correction1;
+            let v_hat = v.data[i] / bias_correction2;
+
+            self.data[i] -= lr * m_hat / (v_hat.sqrt() + epsilon);
         }
     }
 
@@ -207,9 +324,17 @@ impl Matrix {
             return false;
         }
 
+        // Subtract the max value before exponentiating. Mathematically
+        // this changes nothing (softmax(x) == softmax(x - c) for any
+        // constant c), but it keeps every exponent <= 0, which prevents
+        // exp() from overflowing to infinity on large logits — the
+        // overflow that was causing NaN to appear and then propagate
+        // through the whole network permanently.
+        let max = input.data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
         let mut sum = 0.0f32;
         for i in 0..self.data.len() {
-            self.data[i] = input.data[i].exp();
+            self.data[i] = (input.data[i] - max).exp();
             sum += self.data[i];
         }
         self.scale(1.0 / sum);
@@ -257,7 +382,8 @@ impl Matrix {
         }
 
         let size = softmax_out.rows.max(softmax_out.cols);
-        
+        // size comes from an already-valid Matrix, so it's guaranteed
+        // non-zero and can't overflow — this can't actually fail.
         let mut jacobian = Matrix::create(size, size)
             .expect("jacobian size derived from an existing valid matrix");
 
@@ -270,7 +396,7 @@ impl Matrix {
         }
 
         self.mul(&jacobian, grad, false, false, false);
-        
+        // jacobian is dropped automatically here — no manual scratch-arena release needed.
 
         true
     }
@@ -306,52 +432,5 @@ impl Matrix {
         }
 
         true
-    }
-}
-
-fn mat_mul_nn(out: &mut Matrix, a: &Matrix, b: &Matrix) {
-    for i in 0..out.rows as usize {
-        for k in 0..a.cols as usize {
-            for j in 0..out.cols as usize {
-                out.data[j + i * out.cols as usize] +=
-                    a.data[k + i * a.cols as usize] * b.data[j + k * b.cols as usize];
-            }
-        }
-    }
-}
-
-
-fn mat_mul_nt(out: &mut Matrix, a: &Matrix, b: &Matrix) {
-    for i in 0..out.rows as usize {
-        for j in 0..out.cols as usize {
-            for k in 0..a.cols as usize {
-                out.data[j + i * out.cols as usize] +=
-                    a.data[k + i * a.cols as usize] * b.data[k + j * b.cols as usize];
-            }
-        }
-    }
-}
-
-
-fn mat_mul_tn(out: &mut Matrix, a: &Matrix, b: &Matrix) {
-    for k in 0..a.rows as usize {
-        for i in 0..out.rows as usize {
-            for j in 0..out.cols as usize {
-                out.data[j + i * out.cols as usize] +=
-                    a.data[i + k * a.cols as usize] * b.data[j + k * b.cols as usize];
-            }
-        }
-    }
-}
-
-
-fn mat_mul_tt(out: &mut Matrix, a: &Matrix, b: &Matrix) {
-    for i in 0..out.rows as usize {
-        for j in 0..out.cols as usize {
-            for k in 0..a.rows as usize {
-                out.data[j + i * out.cols as usize] +=
-                    a.data[i + k * a.cols as usize] * b.data[k + j * b.cols as usize];
-            }
-        }
     }
 }

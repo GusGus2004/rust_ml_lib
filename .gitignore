@@ -2,3 +2,4 @@
 *.mat
 *.gz
 .DS_Store
+weights/
