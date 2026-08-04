@@ -120,5 +120,5 @@ Roughly in order of "natural next step" to "bigger undertaking":
 - [ ] **More layer/op types** — convolution, and a higher-level
       "Dense layer" helper that bundles weight + bias + activation into
       one call instead of wiring three graph nodes by hand each time
-- [ ] **A general test suite** — unit tests for `Matrix` operations, not
+- [x] **A general test suite** — unit tests for `Matrix` operations, not
       just an end-to-end MNIST run
