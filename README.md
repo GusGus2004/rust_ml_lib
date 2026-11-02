@@ -5,7 +5,7 @@ A NN library and autodiff engine, built from scratch in Rust.
 This started as a translation exercise: taking a small machine learning
 library originally written in C — matrices, a reverse-mode automatic
 differentiation engine, and a training loop - and reimplementing it in
-idiomatic Rust. No external ML crates, just the standard library.
+idiomatic Rust.
 
 Thank you very much to Magicalbat for his inspiration on the original C ML library along with his Youtube too:
 https://github.com/Magicalbat/videos/tree/main/machine-learning
